@@ -1,6 +1,10 @@
 import streamlit as st
 from openai import AzureOpenAI
 import os
+import pandas as pd
+from pymongo.mongo_client import MongoClient
+from pymongo.server_api import ServerApi
+import datetime
 
 st.set_page_config(page_title="AI Meal Planner", page_icon="🍽️", layout="centered")
 
@@ -11,6 +15,123 @@ try:
 except KeyError:
     st.error("OpenAI API key not found. Please set it in Streamlit secrets.")
     st.stop()
+
+
+
+WORKSHEET_NAME = "MealPlans"
+
+def get_mongo_client():
+    mongo_uri = os.getenv("MONGODB_URI")
+    print(f"MongoDB URI: {mongo_uri}")
+    if not mongo_uri:
+        return None
+    
+    try:
+        client = MongoClient(mongo_uri)
+        client.admin.command('ping')
+        return client
+    except Exception as e:
+        st.error(f"An error occurred while connecting to MongoDB: {e}")
+        return None
+
+def fetch_all_meal_plans(db_name="ai_meal_planner", collection_name="meal_plans"):
+    mongo_client = get_mongo_client()
+    if not mongo_client:
+        st.error("MongoDB client could not be established.")
+        return []
+    try:
+        db = mongo_client[db_name]
+        collection = db[collection_name]
+        meal_plans = list(collection.find().sort("timestamp", -1))
+        print(f"Fetched {len(meal_plans)} meal plans from MongoDB.")
+        return meal_plans
+    except Exception as e:
+        st.error(f"An error occurred while fetching meal plans from MongoDB: {e}")
+        return []
+
+
+if 'history' not in st.session_state:
+    st.session_state.history = []
+    
+if 'last_meal_plan' not in st.session_state:
+    st.session_state['last_meal_plan'] = []
+
+def delete_all_meal_plans(db_name="ai_meal_planner", collection_name="meal_plans"):
+    mongo_client = get_mongo_client()
+    if not mongo_client:
+        st.error("MongoDB client could not be established.")
+        return False
+    try:
+        db = mongo_client[db_name]
+        collection = db[collection_name]
+        result = collection.delete_many({})
+        return result.deleted_count
+    except Exception as e:
+        st.error(f"An error occurred while deleting meal plans from MongoDB: {e}")
+        return False
+
+def save_to_mongo(data, db_name="ai_meal_planner", collection_name="meal_plans"):
+
+    if not data:
+        st.error("No data provided to save to MongoDB.")
+        return False
+    
+    mongo_client = get_mongo_client()
+    if not mongo_client:
+        st.error("MongoDB client could not be established.")
+        return False
+    try:
+        db = mongo_client[db_name]
+        collection = db[collection_name]
+        data_to_insert = {
+            "timestamp": data['timestamp'],
+            "title": data['titles'],
+            "calorie_goal": data['inputs']['kcal'],
+            "ingredients_input": data['inputs']['ingredients'],
+            "exact_ingredients": data['inputs']['exact_ingredients'],
+            "extra": data['inputs']['extra'],
+            "full_plan": data['content']
+        }
+        collection.insert_one(data_to_insert)
+        return True
+    except Exception as e:
+        st.error(f"An error occurred while saving to MongoDB: {e}")
+        return False
+
+def save_multiple_records_to_mongo(data_list, db_name="ai_meal_planner", collection_name="meal_plans"):
+    if not data_list:
+        st.error("No data provided to save to MongoDB.")
+        return False
+    
+    mongo_client = get_mongo_client()
+    if not mongo_client:
+        st.error("MongoDB client could not be established.")
+        return False
+    try:
+        db = mongo_client[db_name]
+        collection = db[collection_name]
+        data_to_insert = []
+        for data in data_list:
+            entry = {
+                "timestamp": data['timestamp'],
+                "title": data['titles'],
+                "calorie_goal": data['inputs']['kcal'],
+                "ingredients_input": data['inputs']['ingredients'],
+                "exact_ingredients": data['inputs']['exact_ingredients'],
+                "extra": data['inputs']['extra'],
+                "full_plan": data['content']
+            }
+            data_to_insert.append(entry)
+        if data_to_insert:
+            collection.insert_many(data_to_insert)
+            return True
+        else:
+            return False
+    except Exception as e:
+        st.error(f"An error occurred while saving multiple records to MongoDB: {e}")
+        return False
+
+
 
 st.title("🍽️ AI Meal Planner")
 st.write("Generate personalized meal plans based on your dietary preferences and restrictions.")
@@ -84,6 +205,67 @@ with st.form("meal_plan_form"):
                 if meal_plan:
                     st.subheader("Your Personalized Meal Plan")
                     st.markdown(meal_plan.replace('\n', '  \n'))  # Preserve line breaks in markdown
-                    # st.text_area("Meal Plan:", meal_plan, height=400)
-                    # titles_line = meal_plan.strip().split('\n')[-1]
-                    # st.success(f"Meal Titles: {titles_line}")
+                    try: 
+                        *plan_body, titles_line = meal_plan.split('\n')
+                        plan_titles = titles_line.strip()
+                        plan_contents = '\n'.join(plan_body).strip()
+                    except ValueError:
+                        plan_titles = "Meal Plan Titles Not Found"
+                        plan_contents = meal_plan.strip()
+                    history_entry = {
+                        "titles": plan_titles,
+                        "content": plan_contents,
+                        "timestamp": datetime.datetime.now(),
+                        "inputs":{
+                            "ingredients": ingredients,
+                            "kcal": kcal,
+                            "exact_ingredients": exact_ingredients,
+                            "extra": extra
+                        }
+                    }
+                    st.session_state['last_meal_plan'].append(history_entry)
+                    st.session_state.history.append(history_entry)
+
+if st.session_state['last_meal_plan']:
+    if st.button("Save Meal Plan"):
+        saved = save_multiple_records_to_mongo(st.session_state['last_meal_plan'])          
+        if saved:
+            st.success("Meal plan saved to MongoDB successfully!")
+            st.session_state['last_meal_plan'] = []
+        else:
+            st.error("Failed to save meal plan to MongoDB.")
+
+st.sidebar.title("Meal plan History")
+if st.sidebar.button("Clear History"):
+    st.session_state['history'] = []
+    delete_all_meal_plans()
+    st.rerun()
+
+
+if not st.session_state['history']:
+    st.sidebar.info("No meal plans generated yet.")
+    meal_plans = fetch_all_meal_plans()
+    if meal_plans:
+        for plan in meal_plans:
+            with st.sidebar.expander(f"**{plan.get("title")}**"):
+                st.markdown(plan.get("full_plan").replace('\n', '  \n'))
+                st.caption(f"Ingredients: {plan.get("ingredients_input")}")
+            
+            entry = {
+                "titles": plan.get("title", "No Title"),
+                "content": plan.get("full_plan", "No Content"),
+                "timestamp": plan.get("timestamp"),
+                "inputs": {
+                    "ingredients": plan.get("ingredients_input"),
+                    "kcal": plan.get("calorie_goal"),
+                    "exact_ingredients": plan.get("exact_ingredients", False),
+                    "extra": plan.get("extra", "")
+                }
+            }
+            st.session_state.history.append(entry)
+else:
+    for i, entry in enumerate(st.session_state.history):
+        with st.sidebar.expander(f"**{entry['titles']}**"):
+            st.markdown(entry['content'].replace('\n', '  \n'))
+            st.caption(f"Ingredients: {entry['inputs']['ingredients']}")
+
